@@ -1,0 +1,108 @@
+# Azure DevOps pipeline: Provisions infra (Bicep) + deploys Node.js app to Azure App Service
+# Requirements:
+# 1) Create an Azure Resource Manager service connection named 'sc-azure' with access to your subscription.
+# 2) In the pipeline UI, add a secret variable 'appMessage' with your desired secret value.
+# 3) Ensure your org has parallelism or use a self-hosted agent.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  azureServiceConnection: 'sc-azure'
+  location: 'eastus'
+  rgName: 'rg-web-kv-demo'
+  planName: 'plan-web-kv-demo'
+  appName: 'app-web-kv-demo-001'
+  kvName: 'kv-web-kv-demo-001'
+  secretName: 'app-message'
+
+stages:
+- stage: ProvisionInfra
+  displayName: 'Provision Infrastructure (Bicep)'
+  jobs:
+  - job: Deploy
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Deploy subscription-scoped Bicep (create RG, App Service, KV)'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          echo "Deploying infra to subscription via Bicep..."
+          az deployment sub create \
+            --name "web-kv-deploy-$(Build.BuildId)" \
+            --location "$(location)" \
+            --template-file infra/main.bicep \
+            --parameters \
+              location="$(location)" \
+              rgName="$(rgName)" \
+              planName="$(planName)" \
+              appName="$(appName)" \
+              kvName="$(kvName)" \
+              secretName="$(secretName)" \
+              secretValue="$(appMessage)"
+
+    - task: AzureCLI@2
+      displayName: 'Show outputs'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az group show -n "$(rgName)" -o table
+          az webapp show -g "$(rgName)" -n "$(appName)" -o table
+          az keyvault show -n "$(kvName)" -o table
+
+- stage: BuildAndDeploy
+  displayName: 'Build & Deploy Web App'
+  dependsOn: ProvisionInfra
+  jobs:
+  - job: Build
+    displayName: 'Build Node app'
+    steps:
+    - checkout: self
+
+    - task: NodeTool@0
+      displayName: 'Use Node 18.x'
+      inputs:
+        versionSpec: '18.x'
+
+    - script: |
+        cd app
+        npm ci
+      displayName: 'npm ci'
+
+    - task: ArchiveFiles@2
+      displayName: 'Archive web app'
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)/app'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: '$(Build.ArtifactStagingDirectory)/webapp.zip'
+
+    - publish: '$(Build.ArtifactStagingDirectory)/webapp.zip'
+      artifact: drop
+
+  - job: Deploy
+    displayName: 'Deploy to Azure App Service'
+    dependsOn: Build
+    steps:
+    - download: current
+      artifact: drop
+
+    - task: AzureWebApp@1
+      displayName: 'Azure WebApp Deploy'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        appType: webAppLinux
+        appName: '$(appName)'
+        package: '$(Pipeline.Workspace)/drop/webapp.zip'
